@@ -1,3 +1,5 @@
+library(irlba)
+
 inv.logit.mat <- function(x, min = 0, max = 1) {
   p <- exp(x)/(1 + exp(x))
   which.large=is.na(p) & !is.na(x)
@@ -12,18 +14,29 @@ sparse.logistic.pca <- function(dat,lambda=0,k=2,quiet=TRUE,max.iters=100,conv.c
   # Uses the uniform bound for the log likelihood
   # Can only use lasso=TRUE if lambda is the same for all dimensions, 
   #   which is how this algorithm is coded
-  q=as.matrix(2*dat-1)
-  q[is.na(q)]<-0 # forces x to be equal to theta when data is missing
-  n=nrow(dat)
-  d=ncol(dat)
+  
+  
+  # OLD
+  #q=as.matrix(2*dat-1)
+  
+  # This is substantially faster than the previous method as 
+  # it does the operation on a matrix and not a dataframe
+  q <- (as.matrix(dat)*2)-1
+  q[is.na(q)] <- 0 # forces x to be equal to theta when data is missing
+  n <- nrow(dat)
+  d <- ncol(dat)
+  
   
   # Initialize #
   ##################
   if (!randstart) {
-    mu=colMeans(q)
-    udv=svd(scale(q,center=TRUE,scale=FALSE))
-    A=matrix(udv$u[,1:k],n,k)
-    B=matrix(udv$v[,1:k],d,k) %*% matrix(diag(udv$d[1:k]),k,k)
+    mu <- colMeans(q)
+    
+    # Much faster than svd (only need first k values so why calculate the rest?)
+    udv <- irlba(scale(q,center=TRUE,scale=FALSE), k, k)
+    # These are equivalent to the old method
+    A <- udv$u
+    B <- udv$v %*% matrix(diag(udv$d), k, k)
   } else {
     mu=rnorm(d)
     A=matrix(runif(n*k,-1,1),n,k)
@@ -39,65 +52,85 @@ sparse.logistic.pca <- function(dat,lambda=0,k=2,quiet=TRUE,max.iters=100,conv.c
   # row.names(A)=row.names(dat); row.names(B)=colnames(dat)
   loss.trace=numeric(max.iters)
   
+  
+  mumatrix <- outer(rep(1,n), mu)
+  theta <- mumatrix + tcrossprod(A, B)
+  
   for (m in 1:max.iters) {
     last.mu=mu
     last.A=A
     last.B=B
     
-    theta=outer(rep(1,n),mu)+A %*% t(B)
-    X=as.matrix(theta+4*q*(1-inv.logit.mat(q*theta)))
-    Xcross=X-A %*% t(B)
-    mu=as.numeric(1/n*t(Xcross) %*% rep(1,n))
+    # No context switch required.
+    # Assumes default parameters in inv.logit.mat
+    X <- theta+4*q*(1-(1/(1+exp(-(q*theta)))))
+    Xcross <- X-tcrossprod(A, B)
     
-    theta=outer(rep(1,n),mu)+A %*% t(B)
-    X=as.matrix(theta+4*q*(1-inv.logit.mat(q*theta)))
-    Xstar=X-outer(rep(1,n),mu)
+    mu <- colMeans(Xcross)
+    mumatrix <- outer(rep(1,n), mu)
+    
+    theta <- mumatrix + tcrossprod(A, B)
+    X <- as.matrix(theta+4*q*(1-(1/(1+exp(-(q*theta))))))
+    Xstar <- X - mumatrix
+    
     if (procrustes) {
-      M=svd(Xstar %*% B)
-      A=M$u %*% t(M$v)
+      M <- svd(Xstar %*% B)
+      A <- tcrossprod(M$u, M$v)
+      
     } else {
+      # no changes
       A=Xstar %*% B %*% solve(t(B) %*% B)
       A=qr.Q(qr(A))
     }
     
-    theta=outer(rep(1,n),mu)+A %*% t(B)
-    X=as.matrix(theta+4*q*(1-inv.logit.mat(q*theta)))
-    Xstar=X-outer(rep(1,n),mu)
+    theta <- mumatrix + tcrossprod(A, B)
+    X <- as.matrix(theta+4*q*(1-(1/(1+exp(-(q*theta))))))
+    Xstar <- X - mumatrix
+    
     if (lasso) {
-      B.lse=t(Xstar) %*% A
-      B=sign(B.lse)*pmax(0,abs(B.lse)-4*n*lambda)
+      B.lse <- crossprod(Xstar, A)
+      B <- sign(B.lse)*pmax(0,abs(B.lse)-4*n*lambda)
+      
     } else {
+      # no changes
       C=t(Xstar) %*% A
       B=abs(B)/(abs(B)+4*n*lambda)*C
     }
     
-    loglike=sum(log(inv.logit.mat(q*(outer(rep(1,n),mu)+A %*% t(B))))[!is.na(dat)])
-    penalty=n*lambda*sum(abs(B))
-    loss.trace[m]=(-loglike+penalty)/sum(!is.na(dat))
+    theta <- mumatrix + tcrossprod(A,B)
     
-    if (!quiet) 
-      cat(m,"  ",zapsmall(-loglike),"   ",zapsmall(penalty),"     ",-loglike+penalty, "\n")
+    # slow
+    loglike <- sum(log(1/(1+exp(-(q * theta))))[not.na.dat])
+    penalty <- n*lambda*sum(abs(B))
+    loss.trace[m] <- (penalty-loglike)/sum(!is.na(dat))
+    
+    if (!quiet)
+      cat(m,"\t",zapsmall((loss.trace[m-1]-loss.trace[m])),"\t", (-2*loglike+log(n)*(d+n*k+sum(abs(B)>=1e-10))), "\n")
     
     if (m>4) {
       if ((loss.trace[m-1]-loss.trace[m])<conv.crit)
         break
     }
   }
+  
+  # Past optimum
   if (loss.trace[m-1]<loss.trace[m]) {
-    mu=last.mu
-    A=last.A
-    B=last.B
-    m=m-1
+    mu <- last.mu
+    A <- last.A
+    B <- last.B
+    m <- m-1
     
-    loglike=sum(log(inv.logit.mat(q*(outer(rep(1,n),mu)+A %*% t(B))))[!is.na(dat)])
+    loglike <- sum(log(1/(1+exp(-(q * theta))))[not.na.dat])
   }
+  
   if (normalize) {
     A=sweep(A,2,sqrt(colSums(B^2)),"*")
     B=sweep(B,2,sqrt(colSums(B^2)),"/")
   }
   
-  zeros=sum(abs(B)<1e-10)
-  BIC=-2*loglike+log(n)*(d+n*k+sum(abs(B)>=1e-10))
+  zeros <- sum(abs(B)<1e-10)
+  BIC <- -2*loglike+log(n)*(d+n*k+sum(abs(B)>=1e-10))
+  
   return(list(mu=mu,A=A,B=B,zeros=zeros,BIC=BIC,iters=m,loss.trace=loss.trace[1:m],lambda=lambda))
 }
 
